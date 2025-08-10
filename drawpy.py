@@ -5,8 +5,6 @@ import win32gui
 import win32ui
 import win32api
 import atexit
-import threading
-import sys
 import logging
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -19,6 +17,7 @@ WM_MOUSEMOVE = 0x0200
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_KEYUP = 0x0101
+WM_ERASEBKGND = 0x0014
 
 MOD_ALT = 0x0001
 MOD_SHIFT = 0x0004
@@ -33,7 +32,6 @@ class PAINTSTRUCT(ctypes.Structure):
         ("fIncUpdate", wintypes.BOOL),
         ("rgbReserved", ctypes.c_byte * 32)
     ]
-
 
 HOTKEY_IDS = {
     # Hotkey ID : (modifiers, vk)
@@ -54,28 +52,14 @@ COLOR_MAP = {
     4: win32api.RGB(255, 255, 0),   # Yellow
 }
 
-# Windows API helpers
 user32 = ctypes.WinDLL('user32', use_last_error=True)
-gdi32 = ctypes.windll.gdi32
 kernel32 = ctypes.windll.kernel32
 
-
-def rgb_to_colorref(rgb):
-    # COLORREF is 0x00bbggrr
-    r = rgb & 0xFF
-    g = (rgb >> 8) & 0xFF
-    b = (rgb >> 16) & 0xFF
-    return (b << 16) | (g << 8) | r
 
 class DrawOverlay:
     def __init__(self):
         self.hInstance = kernel32.GetModuleHandleW(None)
-
         self.className = "DrawPyOverlayWindowClass"
-
-        self._register_window_class()
-        self.hwnd = self._create_overlay_window()
-        print(f"[DEBUG] hwnd: {self.hwnd}")
 
         self.is_drawing = False
         self.is_draw_mode = False
@@ -85,40 +69,53 @@ class DrawOverlay:
         self.stroke_points = []
         self.strokes = []  # list of (color_id, [points])
 
+        self.hwnd = None
+        self.memdc = None
+        self.bitmap = None
+
+        self._register_window_class()
+
+        # Create window hidden at start (to allow hotkey registration)
+        self._create_overlay_window(show=False)
         self._create_compatible_bitmap()
 
         self._register_hotkeys()
 
-        self._set_window_clickthrough(True)
+        self._set_window_clickthrough(True)  # Start as click-through & transparent
 
         atexit.register(self.cleanup)
 
         logging.info("drawpy: Activate with Alt+Shift+1..4 to start drawing, hold Alt to keep drawing mode.")
         logging.info("Right-click and drag to draw. Release Alt to exit drawing mode and clear.")
-        logging.info("[info] Overlay window created and shown")
+        logging.info("[info] Overlay window created but hidden")
         logging.info("[info] Registered hotkeys Alt+Shift+1..4 and Alt+1..4")
 
     def _register_window_class(self):
-        # WNDCLASS structure
         wndclass = win32gui.WNDCLASS()
-        wndclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+        wndclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW | win32con.CS_DBLCLKS
         wndclass.lpfnWndProc = self._wnd_proc
         wndclass.hInstance = self.hInstance
         wndclass.hCursor = win32gui.LoadCursor(None, win32con.IDC_ARROW)
-        wndclass.hbrBackground = win32con.COLOR_WINDOW  # White background
+        wndclass.hbrBackground = 0  # No background brush to avoid erase
         wndclass.lpszClassName = self.className
-
         atom = win32gui.RegisterClass(wndclass)
         if not atom:
             raise RuntimeError("Failed to register window class")
 
-    def _create_overlay_window(self):
-        # Create layered transparent fullscreen window
+    def _create_overlay_window(self, show=True):
         screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
 
+        # Extended style: layered, transparent (clickthrough), topmost, composited for flicker reduction
+        exstyle = (
+            win32con.WS_EX_LAYERED
+            | win32con.WS_EX_TRANSPARENT
+            | win32con.WS_EX_TOPMOST
+            | 0x02000000  # WS_EX_COMPOSITED (not in win32con but value is 0x02000000)
+        )
+
         hwnd = win32gui.CreateWindowEx(
-            win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOPMOST,
+            exstyle,
             self.className,
             "DrawPy Overlay",
             win32con.WS_POPUP,
@@ -131,20 +128,20 @@ class DrawOverlay:
             self.hInstance,
             None,
         )
-        
+
         if not hwnd:
             raise RuntimeError("Failed to create overlay window")
 
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-        win32gui.UpdateWindow(hwnd)
-
-        # Set layered window attributes (fully transparent initially)
-        win32gui.SetLayeredWindowAttributes(hwnd, 0, 0, win32con.LWA_ALPHA)
-
-        return hwnd
+        self.hwnd = hwnd
+        if show:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.UpdateWindow(hwnd)
+            # Fully opaque (255) but transparent background initially
+            win32gui.SetLayeredWindowAttributes(hwnd, 0, 0, win32con.LWA_ALPHA)
+        else:
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
     def _create_compatible_bitmap(self):
-        # Create memory DC and bitmap for drawing buffer
         hdc_screen = win32gui.GetDC(0)
         self.memdc = win32gui.CreateCompatibleDC(hdc_screen)
         screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
@@ -153,7 +150,7 @@ class DrawOverlay:
         win32gui.SelectObject(self.memdc, self.bitmap)
         win32gui.ReleaseDC(0, hdc_screen)
 
-        # Fill bitmap with transparent black
+        # Fill bitmap with transparent black (to clear)
         brush = win32gui.GetStockObject(win32con.BLACK_BRUSH)
         rect = (0, 0, screen_w, screen_h)
         win32gui.FillRect(self.memdc, rect, brush)
@@ -168,14 +165,13 @@ class DrawOverlay:
             user32.UnregisterHotKey(self.hwnd, id_)
 
     def _set_window_clickthrough(self, clickthrough: bool):
-        # Toggle WS_EX_TRANSPARENT for click-through when not drawing
         exstyle = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)
         if clickthrough:
             exstyle |= win32con.WS_EX_TRANSPARENT
         else:
             exstyle &= ~win32con.WS_EX_TRANSPARENT
         win32gui.SetWindowLong(self.hwnd, win32con.GWL_EXSTYLE, exstyle)
-        # Update layered attributes to opaque or transparent
+        # Set layered alpha opacity (fully transparent or fully opaque)
         if clickthrough:
             win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 0, win32con.LWA_ALPHA)
         else:
@@ -190,6 +186,10 @@ class DrawOverlay:
             self._on_paint()
             return 0
 
+        elif msg == WM_ERASEBKGND:
+            # Prevent background erase to reduce flicker
+            return 1
+
         elif msg == WM_RBUTTONDOWN:
             if self.is_draw_mode:
                 self.is_drawing = True
@@ -197,9 +197,8 @@ class DrawOverlay:
                 y = win32api.HIWORD(lparam)
                 self.stroke_points = [(x, y)]
                 logging.info("[info] Started drawing stroke")
-                return 0  # Capture event (don't pass to others)
+                return 0
             else:
-                # Pass through when not drawing
                 return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
         elif msg == WM_MOUSEMOVE:
@@ -209,11 +208,9 @@ class DrawOverlay:
                 last_point = self.stroke_points[-1]
                 self.stroke_points.append((x, y))
                 logging.debug(f"[debug] Drawing line at {last_point} to {(x, y)} with color {self.draw_color_id}")
-                # Draw line segment on memdc
                 self._draw_line(last_point, (x, y), self.draw_color)
                 self._invalidate()
-                return 0  # Capture event
-
+                return 0
             else:
                 return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
@@ -223,7 +220,7 @@ class DrawOverlay:
                 self.strokes.append((self.draw_color_id, list(self.stroke_points)))
                 self.stroke_points.clear()
                 logging.info("[info] Ended drawing stroke")
-                return 0  # Capture event
+                return 0
             else:
                 return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
@@ -232,7 +229,6 @@ class DrawOverlay:
                 if self.is_draw_mode:
                     self._exit_draw_mode()
                 return 0
-
             else:
                 return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
@@ -244,11 +240,9 @@ class DrawOverlay:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def _on_hotkey(self, hotkey_id):
-        # Alt+Shift+1..4 or Alt+1..4 triggers enter draw mode or color change
         if hotkey_id in HOTKEY_IDS:
             mod, vk = HOTKEY_IDS[hotkey_id]
             color_num = vk - ord('0')
-            # If Shift pressed, enter draw mode with color; else just change color if in draw mode
             if mod & MOD_SHIFT:
                 self._enter_draw_mode(color_num)
             else:
@@ -263,6 +257,11 @@ class DrawOverlay:
             self.is_draw_mode = True
             self._change_draw_color(color_num)
             self._set_window_clickthrough(False)  # capture mouse
+
+            # Show window now that we're drawing
+            win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+            win32gui.UpdateWindow(self.hwnd)
+
             logging.info(f"[info] Enter draw mode with color {color_num}")
         else:
             self._change_draw_color(color_num)
@@ -280,6 +279,9 @@ class DrawOverlay:
         self.strokes.clear()
         self._clear_bitmap()
         self._set_window_clickthrough(True)  # allow clicks through window
+
+        # Hide window now that we're done drawing
+        win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
         self._invalidate()
         logging.info("[info] Alt released, exit draw mode")
 
@@ -300,23 +302,20 @@ class DrawOverlay:
 
     def _invalidate(self):
         win32gui.InvalidateRect(self.hwnd, None, True)
-    
+
     def _on_paint(self):
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(self.hwnd, ctypes.byref(ps))
         if not hdc:
-            return  # Failed to get HDC, just return
+            return
 
-        # BitBlt from memdc bitmap to window DC
         screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
         win32gui.BitBlt(hdc, 0, 0, screen_w, screen_h, self.memdc, 0, 0, win32con.SRCCOPY)
 
         user32.EndPaint(self.hwnd, ctypes.byref(ps))
 
-
     def run(self):
-        # Message loop
         msg = wintypes.MSG()
         while True:
             bRet = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -331,7 +330,8 @@ class DrawOverlay:
 
     def cleanup(self):
         self._unregister_hotkeys()
-        win32gui.DestroyWindow(self.hwnd)
+        if self.hwnd:
+            win32gui.DestroyWindow(self.hwnd)
         logging.info("[info] Cleanup done")
 
 
