@@ -103,15 +103,16 @@ class DrawOverlay:
             raise RuntimeError("Failed to register window class")
 
     def _create_overlay_window(self, show=True):
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+        vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+        vw = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        vh = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
 
-        # Extended style: layered, transparent (clickthrough), topmost, composited for flicker reduction
         exstyle = (
             win32con.WS_EX_LAYERED
             | win32con.WS_EX_TRANSPARENT
             | win32con.WS_EX_TOPMOST
-            | 0x02000000  # WS_EX_COMPOSITED (not in win32con but value is 0x02000000)
+            | 0x02000000  # WS_EX_COMPOSITED
         )
 
         hwnd = win32gui.CreateWindowEx(
@@ -119,10 +120,10 @@ class DrawOverlay:
             self.className,
             "DrawPy Overlay",
             win32con.WS_POPUP,
-            0,
-            0,
-            screen_w,
-            screen_h,
+            vx,
+            vy,
+            vw,
+            vh,
             None,
             None,
             self.hInstance,
@@ -136,25 +137,28 @@ class DrawOverlay:
         if show:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
             win32gui.UpdateWindow(hwnd)
-            # Fully opaque (255) but transparent background initially
             win32gui.SetLayeredWindowAttributes(hwnd, 0, 0, win32con.LWA_ALPHA)
         else:
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
+
     def _create_compatible_bitmap(self):
+        vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+        vw = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        vh = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+
         hdc_screen = win32gui.GetDC(0)
         self.memdc = win32gui.CreateCompatibleDC(hdc_screen)
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-        self.bitmap = win32gui.CreateCompatibleBitmap(hdc_screen, screen_w, screen_h)
+        self.bitmap = win32gui.CreateCompatibleBitmap(hdc_screen, vw, vh)
         win32gui.SelectObject(self.memdc, self.bitmap)
         win32gui.ReleaseDC(0, hdc_screen)
 
-        # Fill bitmap with transparent black (to clear)
+        # Fill bitmap with transparent black
         brush = win32gui.GetStockObject(win32con.BLACK_BRUSH)
-        rect = (0, 0, screen_w, screen_h)
+        rect = (0, 0, vw, vh)
         win32gui.FillRect(self.memdc, rect, brush)
-
+        
     def _register_hotkeys(self):
         for id_, (mod, vk) in HOTKEY_IDS.items():
             if not user32.RegisterHotKey(self.hwnd, id_, mod, vk):
@@ -286,10 +290,13 @@ class DrawOverlay:
         logging.info("[info] Alt released, exit draw mode")
 
     def _clear_bitmap(self):
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+        vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+        vw = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        vh = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+
         brush = win32gui.GetStockObject(win32con.BLACK_BRUSH)
-        rect = (0, 0, screen_w, screen_h)
+        rect = (0, 0, vw, vh)
         win32gui.FillRect(self.memdc, rect, brush)
 
     def _draw_line(self, pt1, pt2, color):
@@ -309,9 +316,9 @@ class DrawOverlay:
         if not hdc:
             return
 
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-        win32gui.BitBlt(hdc, 0, 0, screen_w, screen_h, self.memdc, 0, 0, win32con.SRCCOPY)
+        vw = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        vh = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        win32gui.BitBlt(hdc, 0, 0, vw, vh, self.memdc, 0, 0, win32con.SRCCOPY)
 
         user32.EndPaint(self.hwnd, ctypes.byref(ps))
 
