@@ -6,6 +6,10 @@ import win32ui
 import win32api
 import atexit
 import logging
+import threading
+import sys
+from PIL import Image, ImageDraw
+import pystray
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -62,6 +66,9 @@ HOTKEY_IDS = {
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.windll.kernel32
 
+# ==========================
+# DRAW OVERLAY CLASS
+# ==========================
 class DrawOverlay:
     def __init__(self):
         self.hInstance = kernel32.GetModuleHandleW(None)
@@ -75,11 +82,11 @@ class DrawOverlay:
         self.stroke_points = []
         self.strokes = []
         self.drawing_button = None
+        self.previous_hwnd = None  # store previous active window
 
         self.hwnd = None
         self.memdc = None
         self.bitmap = None
-        self.previous_hwnd = None  # store previous active window for focus restoration
 
         self._register_window_class()
         self._create_overlay_window(show=False)
@@ -95,6 +102,9 @@ class DrawOverlay:
         logging.info("[info] Overlay window created but hidden")
         logging.info("[info] Registered hotkeys Alt+Shift+1..4 and Alt+1..4")
 
+    # ==========================
+    # WINDOW CREATION
+    # ==========================
     def _register_window_class(self):
         wndclass = win32gui.WNDCLASS()
         wndclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW | win32con.CS_DBLCLKS
@@ -131,6 +141,9 @@ class DrawOverlay:
         else:
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
+    # ==========================
+    # BITMAP & DRAWING
+    # ==========================
     def _create_compatible_bitmap(self):
         vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
         vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
@@ -145,6 +158,9 @@ class DrawOverlay:
 
         self._clear_bitmap()
 
+    # ==========================
+    # HOTKEYS & CLICKTHROUGH
+    # ==========================
     def _register_hotkeys(self):
         for id_, (mod, vk) in HOTKEY_IDS.items():
             if not user32.RegisterHotKey(self.hwnd, id_, mod, vk):
@@ -168,6 +184,9 @@ class DrawOverlay:
         else:
             win32gui.SetLayeredWindowAttributes(self.hwnd, 0, alpha_val, win32con.LWA_ALPHA)
 
+    # ==========================
+    # WINDOW PROCEDURE
+    # ==========================
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_HOTKEY:
             self._on_hotkey(wparam)
@@ -233,6 +252,9 @@ class DrawOverlay:
             return 0
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
+    # ==========================
+    # DRAW LOGIC
+    # ==========================
     def _on_hotkey(self, hotkey_id):
         if hotkey_id in HOTKEY_IDS:
             mod, vk = HOTKEY_IDS[hotkey_id]
@@ -247,9 +269,7 @@ class DrawOverlay:
 
     def _enter_draw_mode(self, color_num):
         if not self.is_draw_mode:
-            # store previous foreground window
             self.previous_hwnd = user32.GetForegroundWindow()
-            # force focus to overlay so it can capture Alt release
             user32.SetForegroundWindow(self.hwnd)
             self.is_draw_mode = True
             self._change_draw_color(color_num)
@@ -277,7 +297,6 @@ class DrawOverlay:
         except Exception:
             pass
         self._invalidate()
-        # Restore focus to previously active window
         if self.previous_hwnd:
             user32.SetForegroundWindow(self.previous_hwnd)
             self.previous_hwnd = None
@@ -335,8 +354,52 @@ class DrawOverlay:
     def cleanup(self):
         self._unregister_hotkeys()
         if self.hwnd:
-            win32gui.DestroyWindow(self.hwnd)
+            try:
+                win32gui.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
 
+# ==========================
+# SYSTEM TRAY INTERFACE
+# ==========================
+class OverlayTray:
+    def __init__(self, overlay_instance: DrawOverlay):
+        self.overlay = overlay_instance
+        self.icon = self._create_icon()
+        self.tray = pystray.Icon("DrawPy", self.icon, "DrawPy Overlay", self._menu())
+        self.thread = threading.Thread(target=self.tray.run, daemon=True)
+        self.thread.start()
+        atexit.register(self.shutdown)
+
+    def _create_icon(self):
+        size = 64
+        image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        # pencil tip
+        draw.polygon([(48, 0), (64, 16), (48, 32), (32, 16)], fill="yellow")
+        # pencil body
+        draw.rectangle([0, 16, 48, 48], fill="gray")
+        # eraser
+        draw.rectangle([0, 48, 16, 64], fill="pink")
+        return image
+
+    def _menu(self):
+        return pystray.Menu(
+            pystray.MenuItem("Exit DrawPy", self.shutdown)
+        )
+
+    def shutdown(self, icon=None, item=None):
+        if self.overlay and self.overlay.hwnd:
+            # post WM_CLOSE to safely destroy overlay from its own thread
+            win32gui.PostMessage(self.overlay.hwnd, win32con.WM_CLOSE, 0, 0)
+        if self.tray:
+            self.tray.stop()
+        sys.exit(0)
+
+# ==========================
+# MAIN EXECUTION
+# ==========================
 if __name__ == "__main__":
     app = DrawOverlay()
+    tray = OverlayTray(app)
     app.run()
