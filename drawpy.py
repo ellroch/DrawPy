@@ -12,8 +12,8 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 # ==========================
 # CONFIGURABLE GLOBALS
 # ==========================
-BACKGROUND_COLOR = win32api.RGB(0, 0, 0)  # background fill color (behind strokes)
-BACKGROUND_ALPHA_PERCENT = 40  # background transparency (0 = fully transparent, 100 = fully opaque)
+BACKGROUND_COLOR = win32api.RGB(0, 0, 0)   # background fill color (behind strokes)
+BACKGROUND_ALPHA_PERCENT = 40              # background transparency (0 = fully transparent, 100 = fully opaque)
 
 COLOR_MAP = {
     1: win32api.RGB(255, 0, 0),     # Red
@@ -28,6 +28,8 @@ WM_HOTKEY = 0x0312
 WM_PAINT = 0x000F
 WM_DESTROY = 0x0002
 WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_KEYUP = 0x0101
@@ -74,7 +76,8 @@ class DrawOverlay:
         self.draw_color = COLOR_MAP[self.draw_color_id]
 
         self.stroke_points = []
-        self.strokes = []  # list of (color_id, [points])
+        self.strokes = []  # list of (color_id, [points]) for persistent (right-click) strokes
+        self.drawing_button = None  # 'L' or 'R' while a stroke is in progress
 
         self.hwnd = None
         self.memdc = None
@@ -90,7 +93,8 @@ class DrawOverlay:
         atexit.register(self.cleanup)
 
         logging.info("drawpy: Activate with Alt+Shift+1..4 to start drawing, hold Alt to keep drawing mode.")
-        logging.info("Right-click and drag to draw. Release Alt to exit drawing mode and clear.")
+        logging.info("Right-click and drag = persistent stroke. Left-click and drag = temporary stroke (erases on release).")
+        logging.info("Release Alt to clear and exit drawing mode.")
         logging.info("[info] Overlay window created but hidden")
         logging.info("[info] Registered hotkeys Alt+Shift+1..4 and Alt+1..4")
 
@@ -179,26 +183,63 @@ class DrawOverlay:
 
         alpha_val = int(255 * (BACKGROUND_ALPHA_PERCENT / 100))
         if clickthrough:
+            # idle: fully transparent & pass-through
             win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 0, win32con.LWA_ALPHA)
         else:
+            # drawing: semi-transparent background with opaque strokes
             win32gui.SetLayeredWindowAttributes(self.hwnd, 0, alpha_val, win32con.LWA_ALPHA)
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_HOTKEY:
             self._on_hotkey(wparam)
             return 0
+
         elif msg == WM_PAINT:
             self._on_paint()
             return 0
+
         elif msg == WM_ERASEBKGND:
             return 1
+
+        # ----- Right-click: persistent stroke -----
         elif msg == WM_RBUTTONDOWN:
             if self.is_draw_mode:
                 self.is_drawing = True
+                self.drawing_button = 'R'
                 x = win32api.LOWORD(lparam)
                 y = win32api.HIWORD(lparam)
                 self.stroke_points = [(x, y)]
                 return 0
+
+        elif msg == WM_RBUTTONUP:
+            if self.is_draw_mode and self.is_drawing and self.drawing_button == 'R':
+                self.is_drawing = False
+                # persist this stroke
+                self.strokes.append((self.draw_color_id, list(self.stroke_points)))
+                self.stroke_points.clear()
+                self.drawing_button = None
+                return 0
+
+        # ----- Left-click: temporary stroke (erase on release) -----
+        elif msg == WM_LBUTTONDOWN:
+            if self.is_draw_mode:
+                self.is_drawing = True
+                self.drawing_button = 'L'
+                x = win32api.LOWORD(lparam)
+                y = win32api.HIWORD(lparam)
+                self.stroke_points = [(x, y)]
+                return 0
+
+        elif msg == WM_LBUTTONUP:
+            if self.is_draw_mode and self.is_drawing and self.drawing_button == 'L':
+                self.is_drawing = False
+                # do NOT persist this stroke; rebuild canvas from persistent strokes
+                self.stroke_points.clear()
+                self.drawing_button = None
+                self._redraw_all()
+                self._invalidate()
+                return 0
+
         elif msg == WM_MOUSEMOVE:
             if self.is_draw_mode and self.is_drawing:
                 x = win32api.LOWORD(lparam)
@@ -208,21 +249,18 @@ class DrawOverlay:
                 self._draw_line(last_point, (x, y), self.draw_color)
                 self._invalidate()
                 return 0
-        elif msg == WM_RBUTTONUP:
-            if self.is_draw_mode and self.is_drawing:
-                self.is_drawing = False
-                self.strokes.append((self.draw_color_id, list(self.stroke_points)))
-                self.stroke_points.clear()
-                return 0
+
         elif msg == WM_KEYUP:
-            if wparam == win32con.VK_MENU:
+            if wparam == win32con.VK_MENU:  # ALT released
                 if self.is_draw_mode:
                     self._exit_draw_mode()
                 return 0
+
         elif msg == WM_DESTROY:
             self._unregister_hotkeys()
             win32gui.PostQuitMessage(0)
             return 0
+
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def _on_hotkey(self, hotkey_id):
@@ -255,9 +293,10 @@ class DrawOverlay:
     def _exit_draw_mode(self):
         self.is_draw_mode = False
         self.is_drawing = False
+        self.drawing_button = None
         self.stroke_points.clear()
-        self.strokes.clear()
-        self._clear_bitmap()
+        self.strokes.clear()          # clear persistent strokes
+        self._clear_bitmap()          # wipe canvas
         self._set_window_clickthrough(True)
         win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
         self._invalidate()
@@ -271,6 +310,14 @@ class DrawOverlay:
         rect = (0, 0, vw, vh)
         win32gui.FillRect(self.memdc, rect, brush)
         win32gui.DeleteObject(brush)
+
+    def _redraw_all(self):
+        """Clear to background and redraw all persistent strokes."""
+        self._clear_bitmap()
+        for color_id, points in self.strokes:
+            color = COLOR_MAP.get(color_id, self.draw_color)
+            for i in range(1, len(points)):
+                self._draw_line(points[i-1], points[i], color)
 
     def _draw_line(self, pt1, pt2, color):
         pen = win32gui.CreatePen(win32con.PS_SOLID, 4, color)
