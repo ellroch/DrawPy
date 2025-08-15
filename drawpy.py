@@ -6,7 +6,6 @@ import win32ui
 import win32api
 import atexit
 import logging
-import struct
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -55,21 +54,7 @@ COLOR_MAP = {
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.windll.kernel32
-gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
 
-# Define CreateDIBSection prototype
-gdi32.CreateDIBSection.restype = wintypes.HBITMAP
-gdi32.CreateDIBSection.argtypes = [
-    wintypes.HDC,
-    ctypes.POINTER(ctypes.c_byte),  # pointer to BITMAPINFO
-    wintypes.UINT,
-    ctypes.POINTER(ctypes.c_void_p),  # pointer to pointer to bits
-    wintypes.HANDLE,
-    wintypes.DWORD
-]
-
-AC_SRC_OVER = 0x00
-AC_SRC_ALPHA = 0x01
 
 class DrawOverlay:
     def __init__(self):
@@ -151,55 +136,24 @@ class DrawOverlay:
         if show:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
             win32gui.UpdateWindow(hwnd)
-            # Do NOT use SetLayeredWindowAttributes here, UpdateLayeredWindow will control transparency
+            # Fully opaque (255) but transparent background initially
+            win32gui.SetLayeredWindowAttributes(hwnd, 0, 0, win32con.LWA_ALPHA)
         else:
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
     def _create_compatible_bitmap(self):
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-
         hdc_screen = win32gui.GetDC(0)
         self.memdc = win32gui.CreateCompatibleDC(hdc_screen)
-
-        # Prepare BITMAPINFO header bytes
-        bmi = struct.pack(
-            '<IiiHHIIIIII',  # little-endian, standard BITMAPINFOHEADER format
-            40,          # biSize
-            screen_w,    # biWidth
-            -screen_h,   # biHeight (negative for top-down)
-            1,           # biPlanes
-            32,          # biBitCount
-            0,           # biCompression (BI_RGB)
-            0,           # biSizeImage
-            0,           # biXPelsPerMeter
-            0,           # biYPelsPerMeter
-            0,           # biClrUsed
-            0            # biClrImportant
-        )
-
-        # Create a ctypes buffer for BITMAPINFO
-        bmi_buffer = ctypes.create_string_buffer(bmi)
-
-        bits_ptr = ctypes.c_void_p()
-        hbitmap = gdi32.CreateDIBSection(
-            hdc_screen,
-            ctypes.cast(bmi_buffer, ctypes.POINTER(ctypes.c_byte)),
-            win32con.DIB_RGB_COLORS,
-            ctypes.byref(bits_ptr),
-            None,
-            0
-        )
-
-        if not hbitmap:
-            err = ctypes.get_last_error()
-            raise ctypes.WinError(err)
-
-        self.bitmap = hbitmap
+        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+        self.bitmap = win32gui.CreateCompatibleBitmap(hdc_screen, screen_w, screen_h)
         win32gui.SelectObject(self.memdc, self.bitmap)
         win32gui.ReleaseDC(0, hdc_screen)
 
-        self._clear_bitmap()
+        # Fill bitmap with transparent black (to clear)
+        brush = win32gui.GetStockObject(win32con.BLACK_BRUSH)
+        rect = (0, 0, screen_w, screen_h)
+        win32gui.FillRect(self.memdc, rect, brush)
 
     def _register_hotkeys(self):
         for id_, (mod, vk) in HOTKEY_IDS.items():
@@ -217,35 +171,11 @@ class DrawOverlay:
         else:
             exstyle &= ~win32con.WS_EX_TRANSPARENT
         win32gui.SetWindowLong(self.hwnd, win32con.GWL_EXSTYLE, exstyle)
-        # Do NOT call SetLayeredWindowAttributes - UpdateLayeredWindow manages alpha
-
-    def _update_layered_window(self):
-        hdc_screen = win32gui.GetDC(0)
-
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-
-        size = (screen_w, screen_h)
-        point_zero = (0, 0)
-
-        # Pass 4-tuple instead of ctypes struct per win32gui.UpdateLayeredWindow expectations
-        blend = (AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)  # BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat
-
-        res = win32gui.UpdateLayeredWindow(
-            self.hwnd,
-            hdc_screen,
-            None,
-            size,
-            self.memdc,
-            point_zero,
-            0,
-            blend,
-            win32con.ULW_ALPHA
-        )
-        win32gui.ReleaseDC(0, hdc_screen)
-
-        if not res:
-            logging.error("UpdateLayeredWindow failed")
+        # Set layered alpha opacity (fully transparent or fully opaque)
+        if clickthrough:
+            win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 0, win32con.LWA_ALPHA)
+        else:
+            win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 255, win32con.LWA_ALPHA)
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_HOTKEY:
@@ -332,8 +262,6 @@ class DrawOverlay:
             win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
             win32gui.UpdateWindow(self.hwnd)
 
-            self._update_layered_window()
-
             logging.info(f"[info] Enter draw mode with color {color_num}")
         else:
             self._change_draw_color(color_num)
@@ -354,33 +282,23 @@ class DrawOverlay:
 
         # Hide window now that we're done drawing
         win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
-        self._update_layered_window()
+        self._invalidate()
         logging.info("[info] Alt released, exit draw mode")
 
     def _clear_bitmap(self):
         screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-        # Fill with black = transparent because alpha channel is zero in DIB section
         brush = win32gui.GetStockObject(win32con.BLACK_BRUSH)
         rect = (0, 0, screen_w, screen_h)
         win32gui.FillRect(self.memdc, rect, brush)
 
     def _draw_line(self, pt1, pt2, color):
-        # GDI pens do not handle alpha, so lines will be fully opaque, which is fine for visibility.
-        # We must convert RGB to BGR for GDI:
-        r = color & 0xFF
-        g = (color >> 8) & 0xFF
-        b = (color >> 16) & 0xFF
-        pen_color = win32api.RGB(b, g, r)
-
-        pen = win32gui.CreatePen(win32con.PS_SOLID, 4, pen_color)
+        pen = win32gui.CreatePen(win32con.PS_SOLID, 4, color)
         old_pen = win32gui.SelectObject(self.memdc, pen)
         win32gui.MoveToEx(self.memdc, pt1[0], pt1[1])
         win32gui.LineTo(self.memdc, pt2[0], pt2[1])
         win32gui.SelectObject(self.memdc, old_pen)
         win32gui.DeleteObject(pen)
-
-        self._update_layered_window()
 
     def _invalidate(self):
         win32gui.InvalidateRect(self.hwnd, None, True)
@@ -390,7 +308,11 @@ class DrawOverlay:
         hdc = user32.BeginPaint(self.hwnd, ctypes.byref(ps))
         if not hdc:
             return
-        # No need to BitBlt because UpdateLayeredWindow handles painting
+
+        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+        win32gui.BitBlt(hdc, 0, 0, screen_w, screen_h, self.memdc, 0, 0, win32con.SRCCOPY)
+
         user32.EndPaint(self.hwnd, ctypes.byref(ps))
 
     def run(self):
@@ -413,4 +335,6 @@ class DrawOverlay:
         logging.info("[info] Cleanup done")
 
 
-if __name
+if __name__ == "__main__":
+    app = DrawOverlay()
+    app.run()
